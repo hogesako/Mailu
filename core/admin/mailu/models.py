@@ -1,7 +1,9 @@
 from mailu import dkim
 
 from sqlalchemy.ext import declarative
-from passlib import context, hash
+import passlib.context
+import passlib.hash
+import passlib.registry
 from datetime import datetime, date
 from email.mime import text
 from flask import current_app as app
@@ -306,6 +308,8 @@ class User(Base, Email):
     """ A user is an email address that has a password to access a mailbox.
     """
     __tablename__ = "user"
+    _ctx = None
+    _credential_cache = {}
 
     domain = db.relationship(Domain,
         backref=db.backref('users', cascade='all, delete-orphan'))
@@ -370,33 +374,73 @@ class User(Base, Email):
                    'MD5-CRYPT': "md5_crypt",
                    'CRYPT': "des_crypt"}
 
-    def get_password_context(self):
-        return context.CryptContext(
-            schemes=self.scheme_dict.values(),
-            default=self.scheme_dict[app.config['PASSWORD_SCHEME']],
+    @classmethod
+    def get_password_context(cls):
+        """ create password context for hashing and verification
+        """
+        if cls._ctx:
+            return cls._ctx
+
+        schemes = passlib.registry.list_crypt_handlers()
+        # scrypt throws a warning if the native wheels aren't found
+        schemes.remove('scrypt')
+        # we can't leave plaintext schemes as they will be misidentified
+        for scheme in schemes:
+            if scheme.endswith('plaintext'):
+                schemes.remove(scheme)
+        cls._ctx = passlib.context.CryptContext(
+            schemes=schemes,
+            default='bcrypt_sha256',
+            bcrypt_sha256__rounds=app.config['CREDENTIAL_ROUNDS'],
+            deprecated='auto'
         )
+        return cls._ctx
 
     def check_password(self, password):
-        context = self.get_password_context()
-        reference = re.match('({[^}]+})?(.*)', self.password).group(2)
-        result = context.verify(password, reference)
-        if result and context.identify(reference) != context.default_scheme():
-            self.set_password(password)
+        """ verifies password against stored hash
+            and updates hash if outdated
+        """
+        cache_result = self._credential_cache.get(self.get_id())
+        current_salt = self.password.split('$')[3] if len(self.password.split('$')) == 5 else None
+        if cache_result and current_salt:
+            cache_salt, cache_hash = cache_result
+            if cache_salt == current_salt:
+                print("cache hit")
+                return passlib.hash.pbkdf2_sha256.verify(password, cache_hash)
+            else:
+                # the cache is local per gunicorn; the password has changed
+                # so the local cache can be invalidated
+                del self._credential_cache[self.get_id()]
+        reference = self.password
+        # strip {scheme} if that's something mailu has added
+        # passlib will identify *crypt based hashes just fine
+        # on its own
+        if reference.startswith(('{PBKDF2}', '{BLF-CRYPT}', '{SHA512-CRYPT}', '{SHA256-CRYPT}', '{MD5-CRYPT}', '{CRYPT}')):
+            reference = reference.split('}', 1)[1]
+
+        result, new_hash = User.get_password_context().verify_and_update(password, reference)
+        if new_hash:
+            self.password = new_hash
             db.session.add(self)
             db.session.commit()
+
+        if result:
+            """The credential cache uses a low number of rounds to be fast.
+While it's not meant to be persisted to cold-storage, no additional measures
+are taken to ensure it isn't (mlock(), encrypted swap, ...) on the basis that
+we have little control over GC and string interning anyways.
+
+ An attacker that can dump the process' memory is likely to find credentials
+in clear-text regardless of the presence of the cache.
+            """
+            self._credential_cache[self.get_id()] = (self.password.split('$')[3], passlib.hash.pbkdf2_sha256.using(rounds=1).hash(password))
         return result
 
-    def set_password(self, password, hash_scheme=None, raw=False):
-        """Set password for user with specified encryption scheme
-           @password: plain text password to encrypt (if raw == True the hash itself)
+    def set_password(self, password, raw=False):
+        """ Set password for user
+            @password: plain text password to encrypt (or, if raw is True: the hash itself)
         """
-        if hash_scheme is None:
-            hash_scheme = app.config['PASSWORD_SCHEME']
-        # for the list of hash schemes see https://wiki2.dovecot.org/Authentication/PasswordSchemes
-        if raw:
-            self.password = '{'+hash_scheme+'}' + password
-        else:
-            self.password = '{'+hash_scheme+'}' + self.get_password_context().encrypt(password, self.scheme_dict[hash_scheme])
+        self.password = password if raw else User.get_password_context().hash(password)
 
     def get_managed_domains(self):
         if self.global_admin:

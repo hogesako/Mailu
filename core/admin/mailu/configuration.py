@@ -59,6 +59,7 @@ DEFAULT_CONFIG = {
     'SESSION_KEY_BITS': 128,
     'SESSION_LIFETIME': 24,
     'SESSION_COOKIE_SECURE': True,
+    'CREDENTIAL_ROUNDS': 12,
     # Host settings
     'HOST_IMAP': 'imap',
     'HOST_LMTP': 'imap:2525',
